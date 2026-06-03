@@ -552,7 +552,10 @@ class MicrophoneManager {
     };
 
     try {
-      this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+      // Reuse pre-warmed stream if already active; avoids redundant permission dialog
+      if (!this.mediaStream || !this.mediaStream.active) {
+        this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+      }
       const audioContext = Tone.context.rawContext || Tone.context._context;
 
       this.mediaStreamSource = audioContext.createMediaStreamSource(
@@ -603,6 +606,19 @@ class MicrophoneManager {
       this.mediaStreamSource = null;
     }
     console.log("✓ Microphone stopped");
+  }
+
+  // Pre-request mic permission silently so start() is instant
+  async prewarm() {
+    if (this.mediaStream && this.mediaStream.active) return;
+    try {
+      this.mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      console.log("✓ Microphone pre-warmed");
+    } catch (e) {
+      console.log("⚠️ Mic pre-warm skipped:", e.message);
+    }
   }
 
   toggleMute() {
@@ -1868,6 +1884,8 @@ class VoiceChatApp {
       // Show profile screen
       this.ui.renderProfile(saved.gamertag, saved.url);
       this.ui.showScreen("profile");
+      // Pre-warm mic permission silently so Join is instant
+      this.micManager.prewarm().catch(() => {});
     } else {
       this.ui.showScreen("setup");
     }
@@ -1939,6 +1957,8 @@ class VoiceChatApp {
       // Show Screen 2
       this.ui.renderProfile(gamertag, url);
       this.ui.showScreen("profile");
+      // Pre-warm mic permission silently so Join is instant
+      this.micManager.prewarm().catch(() => {});
     });
 
     // --- Screen 2: Join button -> connect & go to Screen 3 ---
@@ -2159,6 +2179,13 @@ class VoiceChatApp {
         this.voiceDetector.setSensitivity("high");
       }
 
+      // ─── Show call screen immediately — don't wait for WebSocket ───
+      this.ui.showCallControls(true);
+      this.participantsManager.add(this.currentGamertag, true);
+      this.updateUI();
+      await this.ui.populateMicrophoneSelector();
+      this._setupMicSelector();
+
       this.webrtc.setGamertag(this.currentGamertag);
       this.minecraft.setGamertag(this.currentGamertag);
 
@@ -2202,72 +2229,6 @@ class VoiceChatApp {
       `📡 Initial PTT state sent: ${isTalking ? "TALKING" : "MUTED"}`
     );
 
-    this.ui.showCallControls(true);
-    this.participantsManager.add(this.currentGamertag, true);
-    this.updateUI();
-
-    // NUEVO: Cargar lista de micrófonos disponibles
-    await this.ui.populateMicrophoneSelector();
-
-    // NUEVO: Event listener para cambio de micrófono
-    if (this.ui.elements.micSelector) {
-      const micChangeHandler = async (e) => {
-        const deviceId = e.target.value;
-        if (!deviceId) return;
-
-        try {
-          console.log(`🎤 User selected microphone: ${deviceId}`);
-
-          // Cambiar el micrófono
-          await this.micManager.changeMicrophone(deviceId);
-
-          // Reinicializar el voice detector con el nuevo stream
-          if (this.voiceDetector) {
-            this.voiceDetector.dispose();
-          }
-
-          const micStream = this.micManager.getStream();
-          if (micStream) {
-            this.voiceDetector = new VoiceDetector(
-              micStream,
-              (isTalking, volumeDb) => {
-                if (this.ws && this.ws.readyState === 1) {
-                  this.ws.send(
-                    JSON.stringify({
-                      type: "voice-detection",
-                      gamertag: this.currentGamertag,
-                      isTalking: isTalking,
-                      volume: volumeDb,
-                    })
-                  );
-                }
-              }
-            );
-
-            this.voiceDetector.setSensitivity("high");
-          }
-
-          // Reinicializar WebRTC con el nuevo micrófono
-          await this.webrtc.updateMicrophoneStream(micStream);
-
-          console.log("✅ Microphone changed successfully");
-        } catch (error) {
-          console.error("❌ Error changing microphone:", error);
-          alert("Error changing microphone: " + error.message);
-        }
-      };
-
-      // Remover listener anterior si existe
-      this.ui.elements.micSelector.removeEventListener(
-        "change",
-        this.micChangeHandler
-      );
-      this.micChangeHandler = micChangeHandler;
-      this.ui.elements.micSelector.addEventListener(
-        "change",
-        this.micChangeHandler
-      );
-    }
     this.heartbeatInterval = setInterval(() => {
       if (this.ws && this.ws.readyState === 1) {
         this.ws.send(
@@ -2275,6 +2236,54 @@ class VoiceChatApp {
         );
       }
     }, 15000);
+  }
+
+  _setupMicSelector() {
+    if (!this.ui.elements.micSelector) return;
+
+    const micChangeHandler = async (e) => {
+      const deviceId = e.target.value;
+      if (!deviceId) return;
+
+      try {
+        console.log(`🎤 User selected microphone: ${deviceId}`);
+        await this.micManager.changeMicrophone(deviceId);
+
+        if (this.voiceDetector) {
+          this.voiceDetector.dispose();
+        }
+
+        const micStream = this.micManager.getStream();
+        if (micStream) {
+          this.voiceDetector = new VoiceDetector(
+            micStream,
+            (isTalking, volumeDb) => {
+              if (this.ws && this.ws.readyState === 1) {
+                this.ws.send(
+                  JSON.stringify({
+                    type: "voice-detection",
+                    gamertag: this.currentGamertag,
+                    isTalking: isTalking,
+                    volume: volumeDb,
+                  })
+                );
+              }
+            }
+          );
+          this.voiceDetector.setSensitivity("high");
+        }
+
+        await this.webrtc.updateMicrophoneStream(micStream);
+        console.log("✅ Microphone changed successfully");
+      } catch (error) {
+        console.error("❌ Error changing microphone:", error);
+        alert("Error changing microphone: " + error.message);
+      }
+    };
+
+    this.ui.elements.micSelector.removeEventListener("change", this.micChangeHandler);
+    this.micChangeHandler = micChangeHandler;
+    this.ui.elements.micSelector.addEventListener("change", this.micChangeHandler);
   }
 
   async onWebSocketMessage(msg) {
