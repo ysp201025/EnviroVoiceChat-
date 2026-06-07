@@ -1873,6 +1873,9 @@ class VoiceChatApp {
     this.setupEventListeners();
     this.setupPushToTalk();
 
+    // Set up iOS background / foreground handling once at startup
+    this._setupVisibilityHandling();
+
     // --- Check localStorage: if profile exists, skip to Screen 2 ---
     const saved = UIManager.loadProfile();
     if (saved) {
@@ -2132,6 +2135,10 @@ class VoiceChatApp {
       // MEJORADO: Mejor manejo de errores al iniciar el micrófono
       try {
         await this.micManager.start(1.0);
+        // iOS keep-alive: start silent audio so the mic indicator
+        // stays visible in the status bar when switching apps.
+        this._keepAudioSessionAlive();
+        document.title = "🎙️ EnviroVoice — In Channel";
       } catch (micError) {
         console.error("Microphone error:", micError);
         let userMessage = "❌ Could not access microphone.\n\n";
@@ -2460,6 +2467,81 @@ class VoiceChatApp {
     this.updateUI();
   }
 
+  // =====================================================
+  // iOS BACKGROUND AUDIO SESSION — keep mic indicator
+  // visible even when the user switches to another app.
+  // iOS drops the microphone status-bar indicator when
+  // there is no active audio playback.  Playing a nearly-
+  // silent looped audio element keeps the session alive.
+  // =====================================================
+
+  _keepAudioSessionAlive() {
+    if (this._silentAudio) return; // already running
+
+    // Minimal valid WAV (44 bytes, 1 sample of near-zero)
+    // encoded as a data URI so no network request is needed.
+    const silentWav =
+      "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAA" +
+      "ABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
+
+    const audio = new Audio();
+    audio.src = silentWav;
+    audio.loop = true;
+    audio.volume = 0.001; // inaudible but counts as active playback
+    audio
+      .play()
+      .then(() => console.log("✓ Silent audio session started (iOS keep-alive)"))
+      .catch((e) => console.warn("⚠️ Silent audio play failed:", e));
+
+    this._silentAudio = audio;
+  }
+
+  _stopSilentAudio() {
+    if (!this._silentAudio) return;
+    this._silentAudio.pause();
+    this._silentAudio.src = "";
+    this._silentAudio = null;
+    console.log("✓ Silent audio session stopped");
+  }
+
+  // Called once from init().  Handles returning from another app:
+  // iOS suspends the Web Audio context while backgrounded;
+  // we resume it the moment the user comes back.
+  _setupVisibilityHandling() {
+    document.addEventListener("visibilitychange", async () => {
+      if (document.hidden) return; // going to background — nothing to do here
+
+      // ── Returning to the foreground ──────────────────────────
+      console.log("▶ App foregrounded — checking audio state");
+
+      // 1) Resume Tone / Web Audio context if iOS suspended it
+      try {
+        const ctx = Tone.context;
+        if (ctx && ctx.state === "suspended") {
+          await ctx.resume();
+          console.log("✓ AudioContext resumed");
+        }
+      } catch (e) {
+        console.warn("⚠️ Could not resume AudioContext:", e);
+      }
+
+      // 2) Re-start the silent keep-alive if we are in a call
+      if (this._silentAudio && this._silentAudio.paused) {
+        this._silentAudio
+          .play()
+          .catch((e) => console.warn("⚠️ Silent audio resume failed:", e));
+      }
+
+      // 3) Wake the VoiceDetector's AudioContext if it was frozen
+      if (this.voiceDetector && this.voiceDetector.audioContext) {
+        const vCtx = this.voiceDetector.audioContext;
+        if (vCtx.state === "suspended") {
+          vCtx.resume().catch(() => {});
+        }
+      }
+    });
+  }
+
   exitCall() {
     if (this.ws && this.ws.readyState === 1) {
       this.ws.send(
@@ -2485,6 +2567,10 @@ class VoiceChatApp {
       clearInterval(this.heartbeatInterval);
       this.heartbeatInterval = null;
     }
+
+    // Stop the iOS keep-alive audio and reset the page title
+    this._stopSilentAudio();
+    document.title = "EnviroVoice";
 
     this.ui.showCallControls(false);
     this.ui.updateRoomInfo("");
